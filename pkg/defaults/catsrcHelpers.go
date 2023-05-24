@@ -5,12 +5,14 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"reflect"
 	"strings"
 
 	olmv1alpha1 "github.com/operator-framework/api/pkg/operators/v1alpha1"
 	wrapper "github.com/operator-framework/operator-marketplace/pkg/client"
 	"github.com/sirupsen/logrus"
 	k8sErrors "k8s.io/apimachinery/pkg/api/errors"
+	v1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/util/yaml"
 )
 
@@ -127,56 +129,92 @@ func ensureCatsrcPresent(
 		return nil
 	}
 
-	if cluster.Annotations[defaultCatsrcAnnotationKey] == defaultCatsrcAnnotationValue && AreCatsrcSpecsEqual(&def.Spec, &cluster.Spec) {
+	shallowSpecComparison, deepSpecComparison := AreCatsrcSpecsEqual(&def.Spec, &cluster.Spec)
+
+	if !shallowSpecComparison {
+		// If the spec has changed according to the old shallow comparison method then reset the spec.
+		cluster.Spec = def.Spec
+		if cluster.Annotations == nil {
+			cluster.Annotations = make(map[string]string)
+		}
+		cluster.Annotations[defaultCatsrcAnnotationKey] = defaultCatsrcAnnotationValue
+		logrus.Infof("[defaults] Restoring CatalogSource %s", def.Name)
+	} else if shallowSpecComparison != deepSpecComparison {
+		// If the spec has not changed according to the old shallow comparison method but a change was
+		// detected using the new deep comparison method, then set Upgradeable status to False but
+		// do not reset the spec.
+		cluster.Status.Conditions = append(cluster.Status.Conditions, v1.Condition{
+			Type:               "Upgradeable",
+			Status:             v1.ConditionFalse,
+			Message:            "CatalogSource not Upgradeable",
+			Reason:             "CatalogSource has been modified from default settings and is no longer Upgradeable",
+			LastTransitionTime: v1.Now(),
+		})
+		logrus.Infof("[defaults] A change to the default CatalogSource %s was detected, setting 'Upgradeable' condition to 'False'", def.Name)
+	} else if cluster.Annotations[defaultCatsrcAnnotationKey] == defaultCatsrcAnnotationValue && shallowSpecComparison && deepSpecComparison {
+		// If both the shallow and deep spec comparisons detect no change then we can leave the cluster CatalogSource as-is
 		logrus.Infof("[defaults] CatalogSource %s is annotated and its spec is the same as the default spec", def.Name)
 		return nil
 	}
 
-	// Update if the spec has changed
-	cluster.Spec = def.Spec
-	if cluster.Annotations == nil {
-		cluster.Annotations = make(map[string]string)
-	}
-	cluster.Annotations[defaultCatsrcAnnotationKey] = defaultCatsrcAnnotationValue
+	// If the spec needs to be reset or the 'Upgradeable'='False' condition was added then update the CatalogSource
 	err := client.Update(ctx, cluster)
 	if err != nil {
 		return err
 	}
 
-	logrus.Infof("[defaults] Restoring CatalogSource %s", def.Name)
-
 	return nil
 }
 
-// AreCatsrcSpecsEqual returns true if the Specs it receives are the same.
-// Otherwise, the function returns false.
+// AreCatsrcSpecsEqual performs two comparisons and returns two bools:
+// The first bool is a 'shallow' comparison which maintains past cluster behavior
+// by allowing users to modify fields such as the RegistryPoll settings.
+// The second bool is the result of a deep comparison which will be sensitive to
+// any and all changes made to the default CatalogSource spec.
 //
-// The function performs a case insensitive comparison of corresponding
-// attributes.
+// Both comparisons perform case insensitive comparisons of corresponding attributes.
 //
-// If either of the Specs received is nil, then the function returns false.
-func AreCatsrcSpecsEqual(spec1 *olmv1alpha1.CatalogSourceSpec, spec2 *olmv1alpha1.CatalogSourceSpec) bool {
+// If either of the Specs received is nil, then the function returns false for both bools.
+func AreCatsrcSpecsEqual(spec1 *olmv1alpha1.CatalogSourceSpec, spec2 *olmv1alpha1.CatalogSourceSpec) (bool, bool) {
 	if spec1 == nil || spec2 == nil {
-		return false
+		return false, false
 	}
+	spec1Copy := spec1.DeepCopy()
+	spec2Copy := spec2.DeepCopy()
+
+	spec1Copy.SourceType = olmv1alpha1.SourceType(strings.ToLower(string(spec1Copy.SourceType)))
+	spec2Copy.SourceType = olmv1alpha1.SourceType(strings.ToLower(string(spec2Copy.SourceType)))
+
+	spec1Copy.ConfigMap = strings.ToLower(spec1Copy.ConfigMap)
+	spec2Copy.ConfigMap = strings.ToLower(spec2Copy.ConfigMap)
+
+	spec1Copy.Address = strings.ToLower(spec1Copy.Address)
+	spec2Copy.Address = strings.ToLower(spec2Copy.Address)
+
+	spec1Copy.DisplayName = strings.ToLower(spec1Copy.DisplayName)
+	spec2Copy.DisplayName = strings.ToLower(spec2Copy.DisplayName)
+
+	spec1Copy.Publisher = strings.ToLower(spec1Copy.Publisher)
+	spec2Copy.Publisher = strings.ToLower(spec2Copy.Publisher)
+
+	spec1Copy.Image = strings.ToLower(spec1Copy.Image)
+	spec2Copy.Image = strings.ToLower(spec2Copy.Image)
+
+	deepComparison := reflect.DeepEqual(spec1Copy, spec2Copy)
+
 	if !strings.EqualFold(string(spec1.SourceType), string(spec2.SourceType)) ||
 		!strings.EqualFold(spec1.ConfigMap, spec2.ConfigMap) ||
 		!strings.EqualFold(spec1.Address, spec2.Address) ||
 		!strings.EqualFold(spec1.DisplayName, spec2.DisplayName) ||
 		!strings.EqualFold(spec1.Publisher, spec2.Publisher) ||
 		!strings.EqualFold(spec1.Image, spec2.Image) {
-		return false
+		return false, deepComparison
 	}
 	if spec1.UpdateStrategy != nil && spec2.UpdateStrategy == nil {
-		return false
+		return false, deepComparison
 	}
 	if spec1.UpdateStrategy == nil && spec2.UpdateStrategy != nil {
-		return false
+		return false, deepComparison
 	}
-	if spec1.UpdateStrategy != nil && spec2.UpdateStrategy != nil {
-		if spec1.UpdateStrategy.RegistryPoll != spec1.UpdateStrategy.RegistryPoll {
-			return false
-		}
-	}
-	return true
+	return true, deepComparison
 }
